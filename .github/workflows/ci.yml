@@ -1,0 +1,114 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Conn3x
+        env: &gh
+          GH_TOKEN: ${{ github.token }}
+        run: &install |
+          tag=$(gh release view -R conn3xorg/conn3x --json tagName -q .tagName)
+          file="conn3x_${tag#v}_linux_amd64.tar.gz"
+          cd "$RUNNER_TEMP"
+          curl -sSfLO "https://github.com/conn3xorg/conn3x/releases/download/$tag/$file"
+          curl -sSfLO "https://github.com/conn3xorg/conn3x/releases/download/$tag/checksums.txt"
+          grep " $file\$" checksums.txt | sha256sum -c -
+          mkdir -p bin && tar -xzf "$file" -C bin conn3x
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - run: conn3x version
+      - run: conn3x fmt -check -recursive
+      - name: Validate
+        run: conn3x init -backend=false && conn3x validate
+      - name: Validate the example
+        working-directory: examples/local
+        run: conn3x init -backend=false && conn3x validate
+
+  e2e:
+    needs: validate
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        distro: [rocky10, fedora45, ubuntu2404, debian13]
+    name: e2e (${{ matrix.distro }})
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The test host images live in the Conn3x repo.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: conn3xorg/conn3x
+          ref: main
+          path: conn3x
+          persist-credentials: false
+          sparse-checkout: test/images
+      - name: Install Conn3x
+        env: *gh
+        run: *install
+      - name: Start the ${{ matrix.distro }} host
+        working-directory: examples/local
+        env:
+          CONTAINERFILE: ${{ github.workspace }}/conn3x/test/images/${{ matrix.distro }}/Containerfile
+          # Podman in the host container needs a rootful, privileged container.
+          PODMAN: sudo podman
+        run: ./up.sh
+      - name: Apply, then plan again with no changes
+        working-directory: examples/local
+        run: |
+          conn3x init
+          conn3x apply -auto-approve
+          conn3x plan -detailed-exitcode
+      # Finds a name and an email address, replaces both with placeholders,
+      # and finds a code name from the example's deny-list and an ID from its
+      # pattern, which only works if the mounted analyzer config loaded.
+      # Some test hosts have no curl or Python, so it runs in the analyzer's
+      # container, which shares the host's network.
+      - name: Check analyze, anonymize and the custom recognizers
+        run: &check |
+          sudo podman exec -i circuit-presidio podman exec -i presidio-analyzer python - <<'EOF'
+          import json, time, urllib.request as u
+          o = u.build_opener(u.ProxyHandler({}))
+          def call(url, body=None):
+              data = json.dumps(body).encode() if body else None
+              req = u.Request(url, data, {"Content-Type": "application/json"})
+              return o.open(req, timeout=30).read().decode()
+          for _ in range(300):
+              try:
+                  call("http://127.0.0.1:5002/health")
+                  call("http://127.0.0.1:5001/health")
+                  break
+              except Exception:
+                  time.sleep(1)
+          text = "My name is David Johnson and my email is david@example.com"
+          found = json.loads(call("http://127.0.0.1:5002/analyze", {"text": text, "language": "en"}))
+          assert {"PERSON", "EMAIL_ADDRESS"} <= {r["entity_type"] for r in found}, found
+          out = json.loads(call("http://127.0.0.1:5001/anonymize", {"text": text, "analyzer_results": found}))["text"]
+          assert out == "My name is <PERSON> and my email is <EMAIL_ADDRESS>", out
+          custom = json.loads(call("http://127.0.0.1:5002/analyze", {"text": "Ship Quillfeather to EMP-123456 by Friday", "language": "en"}))
+          assert {"PROJECT_CODENAME", "EMPLOYEE_ID"} <= {r["entity_type"] for r in custom}, custom
+          print("All checks passed.")
+          EOF
+      - name: Restart both services
+        run: sudo podman exec circuit-presidio systemctl restart presidio-analyzer presidio-anonymizer
+      - name: Check again after the restart
+        run: *check
+      - name: Clean up
+        if: always()
+        working-directory: examples/local
+        env:
+          PODMAN: sudo podman
+        run: ./down.sh
