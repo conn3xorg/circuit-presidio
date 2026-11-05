@@ -12,7 +12,7 @@ Presidio is two small HTTP services. The analyzer finds PII, using spaCy's Engli
 
 ```hcl
 module "presidio" {
-  source = "github.com/conn3xorg/circuit-presidio?ref=v0.1.0"
+  source = "github.com/conn3xorg/circuit-presidio?ref=v0.1.1"
 
   hosts                = { gateway = "192.168.1.60" }
   ssh_private_key_file = "~/.ssh/id_ed25519"
@@ -49,7 +49,7 @@ Most organisations have something Presidio has never heard of: project code name
 
 ```hcl
 module "presidio" {
-  source = "github.com/conn3xorg/circuit-presidio?ref=v0.1.0"
+  source = "github.com/conn3xorg/circuit-presidio?ref=v0.1.1"
 
   hosts                = { gateway = "192.168.1.60" }
   ssh_private_key_file = "~/.ssh/id_ed25519"
